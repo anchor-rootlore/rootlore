@@ -1,0 +1,322 @@
+// --- メイン処理関数: getArticlesAndFetchContent ---
+function getArticlesAndFetchContent() {
+  const AIRTABLE_API_URL = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_TABLE_ID_OR_NAME}`;
+
+  const options = {
+    'method': 'get',
+    'headers': {
+      'Authorization': 'Bearer ' + AIRTABLE_PAT,
+      'Content-type': 'application/json'
+    },
+    'muteHttpExceptions': true
+  };
+
+  Logger.log('Airtable APIにリクエストを送信中: ' + AIRTABLE_API_URL);
+
+  try {
+    const response = UrlFetchApp.fetch(AIRTABLE_API_URL, options);
+    const responseCode = response.getResponseCode();
+    const responseBody = response.getContentText();
+
+    if (responseCode === 200) {
+      const data = JSON.parse(responseBody);
+
+      if (data.records && data.records.length > 0) {
+        Logger.log('Airtableから以下の記事が読み込まれました。ウェブコンテンツの取得を開始します:');
+        data.records.forEach(record => {
+          const title = record.fields['記事タイトル'];
+          const url = record.fields['記事URL'];
+
+          Logger.log(`--- 記事ID: ${record.id}, タイトル: ${title || 'N/A'} ---`);
+
+          if (url) {
+            const webContent = fetchWebContent(url); // ウェブコンテンツを取得
+            
+            if (webContent) {
+              const articleMainContent = extractMainContent(webContent); // 記事本文を抽出
+
+              Logger.log(`URL: ${url}`);
+              Logger.log(`**抽出された記事本文の冒頭:** ${articleMainContent.substring(0, 200)}...`); // ログ出力は短めに変更
+
+              // AIに与えるプロンプトを定義
+              const aiPrompt = `以下の記事本文と、もし可能であればサイト全体から得られる情報（フッター、プライバシーポリシー、お問い合わせページなど）を読み、その信頼性について評価してください。0から100の数値で信頼度スコアを評価し、数値のみを回答してください。
+
+評価基準の優先順位と詳細:
+1.  **情報源の信頼性（最重要）:**
+    * 公式データ、学術論文、専門機関の発表、または権威ある個人の引用など、具体的な出典が明記されているか？
+    * 客観的な事実に基づいているか？
+    * 根拠不明の情報、噂、極端な主張がないか？
+    * **運営者情報の透明性:** 会社名、代表者名、住所、連絡先（電話番号など）が明確に記載されているか？ お問い合わせフォームのみで、実態が不明な場合は信頼性を低く評価してください。
+2.  **情報の偏り・客観性:**
+    * 特定の企業、製品、思想、政治的立場などに不当に偏った見解や扇動的な表現がないか？
+    * 記事全体を通してバランスの取れた視点があるか？
+3.  **商業目的の度合いと影響:**
+    * アフィリエイトリンクやPR案件が過剰に多く、情報がそれらの商品販売に誘導するために歪められていないか？
+    * **重要: アフィリエイトリンクや広告が明記されている場合（例: 「この記事にはアフィリエイトリンクが含まれています」などの表示がある場合）、その事実だけで信頼度を過度に下げるべきではありません。ただし、明記されていても情報が商業的な意図によって不正確になっていないか、偏っていないかを最も重視してください。一般的なディスプレイ広告（Google AdSenseなど）についても同様に、記事内容の信頼性を過度に下げるべきではありません。**
+4.  **情報の網羅性と深さ:**
+    * テーマについて十分に掘り下げられ、多角的な情報が提供されているか？
+    * 表面的な情報や、コピペコンテンツのような質ではないか？
+
+上記基準に基づき、最終的な信頼度スコアを数値で提供してください。例: 85`;
+
+              // OpenAI APIを呼び出し
+              const aiAnalysisResult = callOpenAIApi(articleMainContent, aiPrompt);
+
+              if (aiAnalysisResult) {
+                Logger.log(`**AI分析結果（生データ）:** ${aiAnalysisResult}`); // AIの生の応答をログに出力
+
+                // AIの応答から数値スコアを抽出
+                let trustScore = null;
+                try {
+                  const scoreMatch = aiAnalysisResult.match(/\d+/); // 応答中の数字を抽出
+                  if (scoreMatch) {
+                    trustScore = parseInt(scoreMatch[0], 10); // 抽出した数字を整数に変換
+                    // スコアが0から100の範囲内か確認
+                    if (trustScore < 0) trustScore = 0;
+                    if (trustScore > 100) trustScore = 100;
+                  }
+                } catch (e) {
+                  Logger.log('AI応答からのスコア抽出中にエラーが発生しました: ' + e.toString());
+                }
+
+                // 信頼度スコアとステータスのAirtableへの書き込み
+                if (trustScore !== null) {
+                    Logger.log(`**RootLore信頼度スコア:** ${trustScore}`);
+                    
+                    // AIスコアに基づいてステータスを決定
+                    let status = '未分類'; // デフォルト値
+                    if (trustScore >= 70) {
+                        status = '問題なし';
+                    } else if (trustScore >= 40) {
+                        status = '要確認';
+                    } else {
+                        status = '要修正'; // スコアが低い場合は「要修正」
+                    }
+                    
+                    // Airtableに書き込むフィールド名と値を定義
+                    const fieldsToUpdate = {
+                        '信頼度スコア': trustScore,
+                        'ステータス': status
+                    };
+
+                    // Airtableレコードを更新
+                    const updateSuccess = updateAirtableRecord(record.id, fieldsToUpdate);
+                    if (updateSuccess) {
+                        Logger.log(`記事ID: ${record.id} の信頼度スコア ${trustScore} とステータス「${status}」をAirtableに書き込みました。`);
+                    } else {
+                        Logger.log(`記事ID: ${record.id} の信頼度スコアとステータスのAirtableへの書き込みに失敗しました。`);
+                    }
+
+                } else {
+                    // AI応答から信頼度スコアを抽出できなかった場合の処理
+                    Logger.log('AI応答から信頼度スコアを抽出できませんでした。ステータスを「AI分析エラー」に設定します。');
+                    const fieldsToUpdate = {
+                        'ステータス': 'AI分析エラー'
+                    };
+                    updateAirtableRecord(record.id, fieldsToUpdate); // ステータスだけ更新
+                }
+
+            } else { // AI分析に失敗した場合
+              Logger.log('AIによる記事分析に失敗しました。ステータスを「AI分析エラー」に設定します。');
+              const fieldsToUpdate = {
+                'ステータス': 'AI分析エラー'
+              };
+              updateAirtableRecord(record.id, fieldsToUpdate);
+            }
+
+          } else { // webContentがnullの場合 (コンテンツ取得失敗)
+            Logger.log(`URL: ${url} からコンテンツを取得できませんでした。ステータスを「コンテンツ取得失敗」に設定します。`);
+            const fieldsToUpdate = {
+              'ステータス': 'コンテンツ取得失敗'
+            };
+            updateAirtableRecord(record.id, fieldsToUpdate);
+          }
+        } else { // 記事にURLがない場合
+          Logger.log(`記事ID: ${record.id} にはURLがありません。`);
+          // ここでAirtableのステータスを更新することも検討できる (例: 'URLなし')
+          // 現状では何もしないが、必要に応じて追加
+        }
+      });
+      } else {
+        Logger.log('Airtableテーブルにレコードが見つかりませんでした。');
+      }
+    } else {
+      Logger.log(`Airtable APIエラー: ステータスコード ${responseCode}, レスポンス: ${responseBody}`);
+    }
+
+  } catch (e) {
+    Logger.log('Airtableからのデータ読み込み中に予期せぬエラーが発生しました: ' + e.toString());
+  }
+}
+
+/**
+ * 指定されたURLからウェブコンテンツ（HTML）を取得する関数
+ * @param {string} url 取得するウェブページのURL
+ * @returns {string|null} 取得したHTMLコンテンツ、またはエラーの場合はnull
+ */
+function fetchWebContent(url) {
+  try {
+    const response = UrlFetchApp.fetch(url, {
+      'muteHttpExceptions': true,
+      'followRedirects': true
+    });
+    const responseCode = response.getResponseCode();
+
+    if (responseCode === 200) {
+      return response.getContentText();
+    } else {
+      Logger.log(`ウェブコンテンツ取得エラー (${url}): ステータスコード ${responseCode}`);
+      return null;
+    }
+  } catch (e) {
+    Logger.log(`ウェブコンテンツ取得中に予期せぬエラーが発生しました (${url}): ` + e.toString());
+    return null;
+  }
+}
+
+/**
+ * HTMLコンテンツから主要な記事本文を抽出する関数
+ * @param {string} htmlContent 取得したHTMLコンテンツ
+ * @returns {string} 抽出された記事本文テキスト
+ */
+function extractMainContent(htmlContent) {
+  if (!htmlContent) return '';
+
+  let mainText = '';
+
+  const bodyMatch = htmlContent.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+  let targetHtml = bodyMatch ? bodyMatch[1] : htmlContent;
+
+  const articleMatch = targetHtml.match(/<article[^>]*>([\s\S]*?)<\/article>/i);
+  if (articleMatch) {
+    targetHtml = articleMatch[1];
+  } else {
+    const mainMatch = targetHtml.match(/<main[^>]*>([\s\S]*?)<\/main>/i);
+    if (mainMatch) {
+      targetHtml = mainMatch[1];
+    }
+  }
+
+  mainText = targetHtml.replace(/<[^>]*>/g, '');
+  mainText = mainText.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '');
+  mainText = mainText.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '');
+  mainText = mainText.replace(/\s+/g, ' ').trim();
+  mainText = mainText.replace(/(\r\n|\n|\r){2,}/g, '\n\n');
+
+  if (mainText.length > 5000) {
+    mainText = mainText.substring(0, 5000) + '... (以下省略)';
+  }
+
+  return mainText;
+}
+
+// --- ここから新しい「callOpenAIApi」関数を追加します ---
+/**
+ * OpenAI APIを呼び出してテキストを分析する関数
+ * @param {string} textToAnalyze 分析対象のテキスト（記事本文）
+ * @param {string} prompt AIに与える指示（プロンプト）
+ * @returns {string|null} AIの応答テキスト、またはエラーの場合はnull
+ */
+function callOpenAIApi(textToAnalyze, prompt) {
+  if (!OPENAI_API_KEY) {
+    Logger.log('エラー: OpenAI API Keyが設定されていません。');
+    return null;
+  }
+
+  const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions'; // GPT-3.5 Turbo/GPT-4用エンドポイント
+
+  const messages = [
+    { "role": "system", "content": "あなたは与えられたテキストを分析し、ユーザーの指示に従って簡潔に回答するアシスタントです。" },
+    { "role": "user", "content": `${prompt}\n\n記事本文:\n${textToAnalyze}` }
+  ];
+
+  const payload = {
+    "model": "gpt-3.5-turbo", // 使用するモデル (GPT-4を使う場合は "gpt-4" に変更)
+    "messages": messages,
+    "temperature": 0.7, // 応答のランダム性 (0.0-1.0, 低いほど一貫性がある)
+    "max_tokens": 500 // AIの応答の最大トークン数
+  };
+
+  const options = {
+    'method': 'post',
+    'headers': {
+      'Authorization': 'Bearer ' + OPENAI_API_KEY,
+      'Content-Type': 'application/json'
+    },
+    'payload': JSON.stringify(payload),
+    'muteHttpExceptions': true
+  };
+
+  Logger.log('OpenAI APIにリクエストを送信中...');
+
+  try {
+    const response = UrlFetchApp.fetch(OPENAI_API_URL, options);
+    const responseCode = response.getResponseCode();
+    const responseBody = response.getContentText();
+
+    if (responseCode === 200) {
+      const data = JSON.parse(responseBody);
+      if (data.choices && data.choices.length > 0 && data.choices[0].message && data.choices[0].message.content) {
+        Logger.log('OpenAI APIからの応答を受信しました。');
+        return data.choices[0].message.content.trim();
+      } else {
+        Logger.log('OpenAI APIからの応答に予期せぬ形式が含まれています: ' + responseBody);
+        return null;
+      }
+    } else {
+      Logger.log(`OpenAI APIエラー: ステータスコード ${responseCode}, レスポンス: ${responseBody}`);
+      return null;
+    }
+  } catch (e) {
+    Logger.log('OpenAI API呼び出し中に予期せぬエラーが発生しました: ' + e.toString());
+    return null;
+  }
+}
+// --- ここから新しい「updateAirtableRecord」関数を追加します ---
+/**
+ * Airtableの指定されたレコードを更新する関数
+ * @param {string} recordId 更新するレコードのID
+ * @param {object} fieldsToUpdate 更新するフィールドと値のオブジェクト (例: {'信頼度スコア': 85})
+ * @returns {boolean} 更新が成功した場合はtrue、失敗した場合はfalse
+ */
+function updateAirtableRecord(recordId, fieldsToUpdate) {
+  if (!AIRTABLE_PAT || !AIRTABLE_BASE_ID || !AIRTABLE_TABLE_ID_OR_NAME) {
+    Logger.log('エラー: Airtableの認証情報が設定されていません。');
+    return false;
+  }
+
+  const AIRTABLE_API_URL = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_TABLE_ID_OR_NAME}/${recordId}`;
+
+  const payload = {
+    "fields": fieldsToUpdate
+  };
+
+  const options = {
+    'method': 'patch', // PATCHメソッドで部分更新
+    'headers': {
+      'Authorization': 'Bearer ' + AIRTABLE_PAT,
+      'Content-type': 'application/json'
+    },
+    'payload': JSON.stringify(payload),
+    'muteHttpExceptions': true
+  };
+
+  Logger.log(`AirtableレコードID: ${recordId} を更新中...`);
+
+  try {
+    const response = UrlFetchApp.fetch(AIRTABLE_API_URL, options);
+    const responseCode = response.getResponseCode();
+    const responseBody = response.getContentText();
+
+    if (responseCode === 200) {
+      Logger.log(`AirtableレコードID: ${recordId} の更新に成功しました。`);
+      return true;
+    } else {
+      Logger.log(`Airtableレコード更新エラー (ID: ${recordId}): ステータスコード ${responseCode}, レスポンス: ${responseBody}`);
+      return false;
+    }
+  } catch (e) {
+    Logger.log('Airtableレコード更新中に予期せぬエラーが発生しました: ' + e.toString());
+    return false;
+  }
+}
